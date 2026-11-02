@@ -1,0 +1,2 @@
+Censr's OBS add-on is open source, under the GNU General Public License, version 2 or later.
+Its code: https://github.com/abodefy43-spec/obs-addon
