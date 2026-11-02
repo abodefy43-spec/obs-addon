@@ -1,0 +1,103 @@
+# Censr for OBS's add-on (obs-addon/), built for Windows on every pull request and change to dev
+# and main that touches it: OBS's own headers at one pinned version, import libraries made from
+# that same version's own Windows files (their published checksum checked), then the add-on, as a
+# download laid out the way OBS finds plugins. Linux builds it from the system's OBS (see
+# obs-addon/CMakeLists.txt). A Windows minute counts as two, so only when the add-on changes.
+name: OBS add-on (Windows)
+
+on:
+  pull_request:
+    branches: [dev, main]
+    paths: ["obs-addon/**", ".github/workflows/obs-addon.yml"]
+  push:
+    branches: [dev, main]
+    paths: ["obs-addon/**", ".github/workflows/obs-addon.yml"]
+
+concurrency:
+  group: obs-addon-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: OBS add-on for Windows
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      # the oldest OBS the add-on is built for: a plugin built for it loads in the newer ones
+      OBS_VERSION: 32.2.2
+      # GitHub's own checksum for that release's Windows files
+      OBS_SHA256: 4d6e40e3ab155f56b30de517380566a206d74b63cdf5ad49aa596924768f97e1
+      # the remote control (obs-websocket) that release ships, and its header for add-ons' checksum
+      OBS_WEBSOCKET_COMMIT: 1ef34bf48110c2a18184e50e41cd0b1a855e2147
+      OBS_WEBSOCKET_API_SHA256: c29e8e38ee66c36db79cae86217ab0f270aad39f97e82090809d087c281b7948
+    steps:
+      - uses: actions/checkout@v4
+      # a third party's step, so it's pinned to one exact version
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1.13.0
+      - name: OBS's headers at that version
+        # where OBS's headers and libraries go: GitHub only names its temp folder inside a step
+        env:
+          OBS_SDK: ${{ runner.temp }}\obs-sdk
+        run: |
+          $src = Join-Path $env:RUNNER_TEMP "obs-src"
+          git clone --depth 1 --branch $env:OBS_VERSION --filter=blob:none --sparse https://github.com/obsproject/obs-studio.git $src
+          git -C $src sparse-checkout set libobs frontend/api deps/w32-pthreads
+          $include = Join-Path $env:OBS_SDK "include"
+          New-Item -ItemType Directory -Force -Path $include | Out-Null
+          Copy-Item -Recurse "$src\libobs\*" $include
+          Copy-Item "$src\frontend\api\obs-frontend-api.h" $include
+          Copy-Item "$src\deps\w32-pthreads\*.h" $include
+          # the one header OBS's own build makes: only these two lines matter to a plugin
+          "#pragma once`n#define OBS_RELEASE_CANDIDATE 0`n#define OBS_BETA 0" | Out-File -FilePath "$include\obsconfig.h" -Encoding ascii
+          # the remote control's header for add-ons, at the version that release ships, checked
+          $ProgressPreference = 'SilentlyContinue'
+          $ws = "$include\obs-websocket-api.h"
+          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/obsproject/obs-websocket/$env:OBS_WEBSOCKET_COMMIT/lib/obs-websocket-api.h" -OutFile $ws
+          $hash = (Get-FileHash -Algorithm SHA256 -Path $ws).Hash.ToLowerInvariant()
+          if ($hash -ne $env:OBS_WEBSOCKET_API_SHA256) { throw "obs-websocket-api.h isn't the one pinned here: $hash" }
+      - name: OBS's own Windows files, checked, and import libraries made from them
+        env:
+          OBS_SDK: ${{ runner.temp }}\obs-sdk
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP "obs.zip"
+          $ProgressPreference = 'SilentlyContinue'
+          Invoke-WebRequest -Uri "https://github.com/obsproject/obs-studio/releases/download/$env:OBS_VERSION/OBS-Studio-$env:OBS_VERSION-Windows-x64.zip" -OutFile $zip
+          $hash = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash.ToLowerInvariant()
+          if ($hash -ne $env:OBS_SHA256) { throw "OBS's Windows files aren't the ones pinned here: $hash" }
+          $obs = Join-Path $env:RUNNER_TEMP "obs"
+          Expand-Archive -Path $zip -DestinationPath $obs
+          $lib = Join-Path $env:OBS_SDK "lib"
+          New-Item -ItemType Directory -Force -Path $lib | Out-Null
+          foreach ($name in 'obs', 'obs-frontend-api', 'w32-pthreads') {
+            $dll = Get-ChildItem -Path $obs -Recurse -Filter "$name.dll" | Where-Object { $_.FullName -match '64bit' } | Select-Object -First 1
+            if (-not $dll) { throw "$name.dll isn't in OBS's Windows files" }
+            $names = & dumpbin /nologo /exports $dll.FullName | ForEach-Object {
+              if ($_ -match '^\s+\d+\s+[0-9A-F]+\s+[0-9A-F]+\s+(\S+)') { $Matches[1] } }
+            if (-not $names) { throw "no exports read from $name.dll" }
+            "LIBRARY $name`nEXPORTS`n" + ($names -join "`n") | Out-File -FilePath "$lib\$name.def" -Encoding ascii
+            & lib /nologo /def:"$lib\$name.def" /out:"$lib\$name.lib" /machine:x64
+            if ($LASTEXITCODE -ne 0) { throw "couldn't make $name.lib" }
+          }
+      - name: Build
+        env:
+          OBS_SDK: ${{ runner.temp }}\obs-sdk
+        run: |
+          cmake -S obs-addon -B obs-addon/build -A x64 -DOBS_SDK="$env:OBS_SDK"
+          if ($LASTEXITCODE -ne 0) { throw "CMake couldn't set up the build" }
+          cmake --build obs-addon/build --config RelWithDebInfo
+          if ($LASTEXITCODE -ne 0) { throw "the add-on didn't build" }
+      - name: Laid out as OBS finds plugins
+        run: |
+          $out = "obs-addon/package/censr-obs"
+          New-Item -ItemType Directory -Force -Path "$out/bin/64bit", "$out/data" | Out-Null
+          Copy-Item "obs-addon/build/RelWithDebInfo/censr-obs.dll" "$out/bin/64bit/"
+          Copy-Item -Recurse "obs-addon/data/*" "$out/data/"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: censr-obs-windows
+          path: obs-addon/package
